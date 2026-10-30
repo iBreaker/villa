@@ -25,6 +25,11 @@ LABEL_TIFF_NAME_RE = re.compile(
     r"(?:_v(?P<version_num>\d+))?(?P<extension>\.tiff?)$",
     re.IGNORECASE,
 )
+LABEL_ZARR_NAME_RE = re.compile(
+    r"^(?P<prefix>.*)_(?P<label_kind>inklabels|supervision_mask|validation_mask)"
+    r"(?:_v(?P<version_num>\d+))?(?P<extension>\.zarr)$",
+    re.IGNORECASE,
+)
 REQUIRED_LABEL_KINDS = ("inklabels", "supervision_mask")
 ALLOWED_BINARY_LABEL_VALUES = frozenset({0, 1, 255})
 
@@ -82,6 +87,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--no-progress",
         action="store_true",
         help="Disable tqdm progress reporting.",
+    )
+    parser.add_argument(
+        "--label-format",
+        choices=("tiff", "zarr"),
+        default="tiff",
+        help=(
+            "tiff checks TIFF shape and contents (default); zarr checks only "
+            "label array spatial shapes at level 0, without reading pixels. "
+            "Equal shapes do not establish coordinate alignment."
+        ),
     )
     parser.add_argument(
         "--version-id",
@@ -296,7 +311,7 @@ def validate_label_tiff(
     return tuple(issues)
 
 
-def _resolve_zarr_array(zarr_path: Path) -> zarr.Array:
+def _resolve_zarr_array(zarr_path: Path, *, require_level_zero: bool = False) -> zarr.Array:
     root = zarr.open(str(zarr_path), mode="r")
 
     if isinstance(root, zarr.Array):
@@ -307,6 +322,9 @@ def _resolve_zarr_array(zarr_path: Path) -> zarr.Array:
             array = root["0"]
             if isinstance(array, zarr.Array):
                 return array
+
+        if require_level_zero:
+            raise ValueError(f"Expected a level-0 array named '0' in {zarr_path}")
 
         array_keys = sorted(str(key) for key in root.array_keys())
         if len(array_keys) == 1:
@@ -475,6 +493,67 @@ def validate_root(
     return results
 
 
+def read_label_canvas_shape(path: Path) -> tuple[int, int]:
+    """Resolve the existing level-0 convention for YX or ZYX label assets."""
+    shape = _resolve_zarr_array(path, require_level_zero=True).shape
+    if len(shape) not in (2, 3):
+        raise ValueError(f"Expected YX or ZYX array in {path}, got shape {shape}")
+    return int(shape[-2]), int(shape[-1])
+
+
+def validate_zarr_labels(
+    root: Path,
+    *,
+    label_version: int | None = None,
+) -> list[SegmentResult]:
+    """Check same-origin label canvas sizes, without reading label contents.
+
+    A mismatch requires review of the source frames; it is not evidence of a
+    particular displacement. Never crop, pad, or infer a registration here.
+    """
+    segment_dirs = discover_segment_dirs(root)
+    if not segment_dirs:
+        raise FileNotFoundError(f"No segment directories found under {root}")
+    results: list[SegmentResult] = []
+    for segment_dir in segment_dirs:
+        issues: list[ShapeIssue] = []
+        image_path = segment_dir / f"{segment_dir.name}.zarr"
+        expected_shape = None
+        try:
+            expected_shape = read_label_canvas_shape(image_path)
+        except Exception as exc:
+            issues.append(ShapeIssue(image_path, f"Failed to read image Zarr shape: {exc}"))
+        present: set[str] = set()
+        for path in sorted(segment_dir.iterdir()):
+            if not path.is_dir():
+                continue
+            match = LABEL_ZARR_NAME_RE.match(path.name)
+            if match is None or match.group("prefix") != segment_dir.name:
+                continue
+            version = int(match.group("version_num") or 1)
+            if label_version is not None and version != label_version:
+                continue
+            present.add(match.group("label_kind").lower())
+            try:
+                shape = read_label_canvas_shape(path)
+            except Exception as exc:
+                issues.append(ShapeIssue(path, f"Failed to read label Zarr shape: {exc}"))
+                continue
+            if expected_shape is not None and shape != expected_shape:
+                issues.append(ShapeIssue(
+                    path,
+                    f"shape {shape[0]}x{shape[1]} does not match image Zarr "
+                    f"{expected_shape[0]}x{expected_shape[1]}; review the canvas "
+                    "mapping before pairing these assets (no offset inferred)",
+                ))
+        version_suffix = f" for version {_format_version_id(label_version)}" if label_version is not None else ""
+        for kind in REQUIRED_LABEL_KINDS:
+            if kind not in present:
+                issues.append(ShapeIssue(segment_dir, f"missing required label Zarr{version_suffix} containing '{kind}'"))
+        results.append(SegmentResult(segment_dir, expected_shape, tuple(issues)))
+    return results
+
+
 def _format_result(root: Path, result: SegmentResult) -> str:
     segment_label = result.segment_dir.relative_to(root).as_posix()
     lines = [f"[{segment_label}]"]
@@ -505,12 +584,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
-    results = validate_root(
-        root,
-        workers=args.workers,
-        show_progress=not args.no_progress,
-        label_version=label_version,
-    )
+    if args.label_format == "zarr":
+        results = validate_zarr_labels(root, label_version=label_version)
+        print("Zarr metadata-only check at level 0; no pixels read. "
+              "Equal spatial shapes do not establish coordinate alignment.")
+    else:
+        results = validate_root(
+            root,
+            workers=args.workers,
+            show_progress=not args.no_progress,
+            label_version=label_version,
+        )
     bad_results = [result for result in results if result.issues]
     total_issues = sum(len(result.issues) for result in bad_results)
 
@@ -518,6 +602,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Checked {len(results)} segment(s) under {root}{version_suffix}")
 
     if not bad_results:
+        if args.label_format == "zarr":
+            print("Selected label Zarr spatial shapes match their image Zarr; "
+                  "label contents and coordinate alignment were not checked.")
+            return 0
         print(
             "All relevant TIFF files match their segment .zarr spatial shape, and label TIFFs are binary without alpha channels."
         )
